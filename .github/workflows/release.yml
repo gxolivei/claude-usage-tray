@@ -1,0 +1,79 @@
+# Builds ClaudeUsage.exe from the tagged source on a clean Windows runner, signs it with
+# Azure Artifact Signing when configured, and publishes it with a SHA-256 checksum.
+#
+# Release: git tag v1.2.3 && git push origin v1.2.3
+#
+# Signing turns on once these are set in Settings > Secrets and variables > Actions:
+#   secrets:   AZURE_TENANT_ID, AZURE_CLIENT_ID, AZURE_CLIENT_SECRET
+#   variables: ARTIFACT_SIGNING_ENDPOINT (e.g. https://eus.codesigning.azure.net/),
+#              ARTIFACT_SIGNING_ACCOUNT, ARTIFACT_SIGNING_PROFILE
+# Without them the release is published unsigned.
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    env:
+      SIGN: ${{ vars.ARTIFACT_SIGNING_ACCOUNT != '' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Build
+        shell: cmd
+        run: call build.cmd
+
+      - name: Sign
+        if: env.SIGN == 'true'
+        uses: Azure/artifact-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2.0.0
+        with:
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          endpoint: ${{ vars.ARTIFACT_SIGNING_ENDPOINT }}
+          signing-account-name: ${{ vars.ARTIFACT_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ vars.ARTIFACT_SIGNING_PROFILE }}
+          files: ${{ github.workspace }}\ClaudeUsage.exe
+          description: Claude Usage Tray
+          description-url: https://github.com/${{ github.repository }}
+
+      - name: Verify signature
+        if: env.SIGN == 'true'
+        shell: pwsh
+        run: |
+          $sig = Get-AuthenticodeSignature ClaudeUsage.exe
+          if ($sig.Status -ne 'Valid') { throw "Signature is $($sig.Status): $($sig.StatusMessage)" }
+          "Signed by: $($sig.SignerCertificate.Subject)"
+
+      - name: Checksum
+        shell: pwsh
+        run: |
+          $hash = (Get-FileHash ClaudeUsage.exe -Algorithm SHA256).Hash.ToLower()
+          "$hash  ClaudeUsage.exe" | Set-Content SHA256SUMS.txt -Encoding ascii
+          "HASH=$hash" >> $env:GITHUB_ENV
+
+      - name: Publish
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $signed = if ($env:SIGN -eq 'true') { 'Signed with Azure Artifact Signing.' } else { 'Unsigned: Windows SmartScreen will warn on first run (More info > Run anyway).' }
+          @"
+          Download **ClaudeUsage.exe** and run it. No installer needed. Requires Windows 10/11 and a logged-in Claude Code (on Windows or in WSL).
+
+          $signed Built from this tag by GitHub Actions.
+
+          **SHA-256:** ``$env:HASH``
+
+          Verify in PowerShell: ``(Get-FileHash .\ClaudeUsage.exe).Hash``. It should match the line above (case doesn't matter).
+
+          See the README for privacy notes, how polling works, and building from source.
+          "@ | Set-Content notes.md -Encoding utf8
+          gh release create $env:GITHUB_REF_NAME ClaudeUsage.exe SHA256SUMS.txt --title $env:GITHUB_REF_NAME --notes-file notes.md

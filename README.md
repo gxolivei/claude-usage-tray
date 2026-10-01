@@ -27,20 +27,50 @@ the tray and changes color only when a limit gets close.
 
 ## Install
 
-Download `ClaudeUsage.exe` from the [latest release](../../releases/latest) and run it.
-To launch it at sign-in, right-click the tray icon and check **Start with Windows**.
+1. Download `ClaudeUsage.exe` from the [latest release](../../releases/latest).
+2. Run it. There's no installer: the widget runs from wherever you saved the file, so put
+   it somewhere permanent first (for example `%LOCALAPPDATA%\Programs\ClaudeUsageTray`).
+3. To launch it at sign-in, right-click the tray icon and check **Start with Windows**.
+   This adds a per-user startup entry and needs no admin rights. If you later move the
+   exe, toggle it off and on again.
 
-Or build it yourself (below).
+**Can't see the icon?** Windows 11 hides new tray icons behind the **^** arrow. Drag it
+onto the taskbar, or turn it on under Settings > Personalization > Taskbar > Other system
+tray icons.
 
-## Build
+**Windows warnings on first run.** Browsers and Windows treat new downloads cautiously:
+
+- Edge or Chrome may say the file isn't commonly downloaded: choose **Keep**.
+- If the release is unsigned (the release notes say so), SmartScreen shows "Windows
+  protected your PC": click **More info > Run anyway**.
+- **Smart App Control** (Windows 11) blocks unsigned apps with no override. Use a signed
+  release, or build from source.
+
+**Check your download.** Each release lists the exe's SHA-256 hash and includes a
+`SHA256SUMS.txt` file. In PowerShell:
+
+```powershell
+(Get-FileHash .\ClaudeUsage.exe).Hash
+```
+
+The result should match the release notes (case doesn't matter). Release builds are made
+from the tagged source by [GitHub Actions](.github/workflows/release.yml), not on a
+developer's machine.
+
+## Build from source
+
+The widget reads your Claude login token, so if you'd rather not trust a downloaded
+binary, build it yourself. It takes a few seconds and needs nothing installed:
 
 ```cmd
+git clone https://github.com/gxolivei/claude-usage-tray
+cd claude-usage-tray
 build.cmd
 ```
 
 `build.cmd` compiles `src\Program.cs` with the `csc.exe` that ships with Windows. No SDK
-or Visual Studio needed. Quit the running widget first so `ClaudeUsage.exe` can be
-overwritten.
+or Visual Studio needed. The whole app is that one file, so it's practical to read before
+you run it. Quit the running widget first so `ClaudeUsage.exe` can be overwritten.
 
 ## Privacy
 
@@ -72,6 +102,13 @@ Nothing else calls the API:
 Each launch fetches immediately, so relaunching the widget repeatedly (for example while
 developing) uses up the token's allowance too. Because the endpoint is undocumented, it may
 change or break without notice.
+
+## Releasing
+
+Push a version tag (`git tag v1.2.3 && git push origin v1.2.3`). The
+[release workflow](.github/workflows/release.yml) builds, signs when signing is
+configured, computes the checksum, and publishes the GitHub release. Its header lists the
+Azure Artifact Signing secrets and variables it needs.
 
 ## License
 
