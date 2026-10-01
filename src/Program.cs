@@ -358,13 +358,18 @@ namespace ClaudeUsageTray
         public string Kind, Label, Severity;
         public double Pct;
         public DateTime? ResetUtc;
+
+        // Alert thresholds shared by the tray tint and the balloon notifications.
+        public const int WarnPct = 80, BadPct = 95;
+
+        // Percent for display and alerting: a limit the API flags as hit counts as full.
+        public double EffectivePct { get { return Severity == "critical" || Severity == "exceeded" ? 100 : Pct; } }
     }
 
     class ApiResult
     {
         public object Raw;
         public string Error, Plan;
-        public bool RateLimited;
         public DateTime FetchedUtc;
         public TimeSpan? Skew;
 
@@ -428,7 +433,7 @@ namespace ClaudeUsageTray
                 var hr = we.Response as HttpWebResponse;
                 int code = hr == null ? 0 : (int)hr.StatusCode;
                 if (code == 401) res.Error = "Login expired — use Claude Code once to refresh it";
-                else if (code == 429) { res.Error = "Rate limited — next try in 10 min"; res.RateLimited = true; }
+                else if (code == 429) res.Error = "Rate limited — next try in " + TrayApp.PollMinutes + " min";
                 else res.Error = code > 0 ? "API error " + code : "Offline";
             }
             catch (Exception e) { res.Error = e.Message; }
@@ -496,9 +501,10 @@ namespace ClaudeUsageTray
 
         public static bool TaskbarLight() { return RegFlag("SystemUsesLightTheme"); }
 
-        public static Palette Current()
+        public static Palette Current() { return For(Force != null ? Force == "light" : RegFlag("AppsUseLightTheme")); }
+
+        public static Palette For(bool light)
         {
-            bool light = Force != null ? Force == "light" : RegFlag("AppsUseLightTheme");
             return light
                 ? new Palette
                 {
@@ -546,7 +552,7 @@ namespace ClaudeUsageTray
 
         public Color ForLimit(Limit l)
         {
-            return Usage(l.Severity == "critical" || l.Severity == "exceeded" ? 100 : l.Pct);
+            return Usage(l.EffectivePct);
         }
 
         public Color ForFamily(string fam)
@@ -591,9 +597,10 @@ namespace ClaudeUsageTray
         // fetch once at launch, then every PollMinutes, plus whenever the user clicks Refresh.
         // Nothing else triggers a fetch: opening the popup only rescans local transcripts, and
         // errors (429 included) wait for the next regular poll rather than retrying sooner.
-        // A Refresh click restarts the 10-minute cycle. See README.md.
-        const int PollMinutes = 10;
+        // A Refresh click restarts the PollMinutes cycle. See README.md.
+        public const int PollMinutes = 10;
         DateTime nextFetchUtc = DateTime.MinValue;
+        string iconKey;
         readonly HashSet<string> notified = new HashSet<string>();
 
         public DateTime NowUtc { get { return DateTime.UtcNow + Skew; } }
@@ -612,7 +619,7 @@ namespace ClaudeUsageTray
             var h = popup.Handle; // create handle so BeginInvoke works before first show
 
             var menu = new ContextMenuStrip();
-            menu.Items.Add("Refresh now", null, delegate { RefreshAll(true); });
+            menu.Items.Add("Refresh now", null, delegate { RefreshAll(); });
             menu.Items.Add("Open usage page", null, delegate { Open("https://claude.ai/settings/usage"); });
             menu.Items.Add(new ToolStripSeparator());
             startupItem = new ToolStripMenuItem("Start with Windows", null, delegate { ToggleStartup(); });
@@ -629,7 +636,7 @@ namespace ClaudeUsageTray
 
             timer.Tick += delegate { Tick(); };
             timer.Start();
-            RefreshAll(true);
+            RefreshAll();
         }
 
         protected override void ExitThreadCore()
@@ -651,17 +658,14 @@ namespace ClaudeUsageTray
             if (ticks % 30 == 0) UpdateTray();
         }
 
-        public void RefreshAll(bool force)
+        public void RefreshAll()
         {
-            if (force) nextFetchUtc = DateTime.MinValue;
+            nextFetchUtc = DateTime.MinValue;   // if a fetch is already in flight, the next tick fetches again
             Scan();
             Fetch();
         }
 
-        // Popup opened: refresh local transcript stats only; the API stays on its schedule.
-        public void Rescan() { Scan(); }
-
-        void Scan()
+        public void Scan()
         {
             if (scanning) return;
             scanning = true;
@@ -717,14 +721,11 @@ namespace ClaudeUsageTray
         void UpdateTray()
         {
             var limits = Limits();
-            var pal = Palette.Current();
             var session = limits.FirstOrDefault(l => l.Kind == "session");
             var week = limits.FirstOrDefault(l => l.Kind == "weekly_all");
             if (session == null) { SetIcon(-1, 0); tray.Text = Trim("Claude usage — " + (Api != null && Api.Error != null ? Api.Error : "no data")); return; }
 
-            var worst = limits.OrderByDescending(l => l.Pct).First();
-            bool critical = worst.Severity == "critical" || worst.Severity == "exceeded";
-            SetIcon(session.Pct, critical ? 100 : worst.Pct);
+            SetIcon(session.Pct, limits.Max(l => l.EffectivePct));
             var text = "Claude · 5h " + Math.Round(session.Pct) + "%";
             if (session.ResetUtc.HasValue) text += " (" + Fmt.Span(session.ResetUtc.Value - NowUtc) + ")";
             if (week != null) text += " · week " + Math.Round(week.Pct) + "%";
@@ -738,7 +739,7 @@ namespace ClaudeUsageTray
         {
             foreach (var l in Limits())
             {
-                foreach (var t in new[] { 80, 95 })
+                foreach (var t in new[] { Limit.WarnPct, Limit.BadPct })
                 {
                     if (l.Pct < t) continue;
                     var key = l.Kind + l.Label + t + (l.ResetUtc.HasValue ? l.ResetUtc.Value.Ticks.ToString() : "");
@@ -756,10 +757,18 @@ namespace ClaudeUsageTray
         {
             int s = SystemInformation.SmallIconSize.Width;
             bool lightBar = Palette.TaskbarLight();
+            var tp = Palette.For(lightBar);   // the tray follows the taskbar theme, not the apps theme
             var fg = lightBar ? Color.FromArgb(28, 28, 28) : Color.FromArgb(245, 245, 245);
-            Color tint = worst >= 95 ? (lightBar ? Color.FromArgb(0xD6, 0x45, 0x41) : Color.FromArgb(0xF0, 0x60, 0x5A))
-                       : worst >= 80 ? (lightBar ? Color.FromArgb(0xC9, 0x8A, 0x1B) : Color.FromArgb(0xF0, 0xB4, 0x4C))
-                       : fg;
+            Color tint = worst >= Limit.BadPct ? tp.Bad : worst >= Limit.WarnPct ? tp.Warn : fg;
+            // A hint of fill even at 1%, so "in use" never reads as "empty"; the 8° floor also keeps
+            // FillPie clear of GDI+'s near-zero-sweep exception. Whole degrees are finer than 16px shows.
+            float sweep = pct > 0 && pct < 100 ? Math.Max(8f, (float)Math.Round(pct * 3.6)) : 0;
+
+            // Called every 30s but the inputs change rarely: skip identical redraws (and the Explorer round trip).
+            var key = s + "|" + lightBar + "|" + tint.ToArgb() + "|" + (pct < 0 ? "none" : pct >= 100 ? "full" : sweep.ToString(CultureInfo.InvariantCulture));
+            if (key == iconKey) return;
+            iconKey = key;
+
             const int ss = 4;   // drawn at 4x and downsampled, for clean edges at 16px
             using (var big = new Bitmap(s * ss, s * ss, PixelFormat.Format32bppPArgb))
             using (var bmp = new Bitmap(s, s, PixelFormat.Format32bppArgb))
@@ -776,8 +785,7 @@ namespace ClaudeUsageTray
                     if (pct >= 100)
                     {
                         // Limit reached: the dial closes into one solid disc.
-                        float R = ringR + ringW / 2;
-                        using (var b = new SolidBrush(tint)) g.FillEllipse(b, c - R, c - R, 2 * R, 2 * R);
+                        using (var b = new SolidBrush(tint)) g.FillEllipse(b, RectangleF.Inflate(ringRect, ringW / 2, ringW / 2));
                     }
                     else
                     {
@@ -785,12 +793,10 @@ namespace ClaudeUsageTray
                         using (var p = new Pen(ringColor, ringW)) g.DrawEllipse(p, ringRect);
                     }
 
-                    if (pct > 0 && pct < 100)
+                    if (sweep > 0)
                     {
                         float pieR = 4.9f * u;
                         var pieRect = new RectangleF(c - pieR, c - pieR, 2 * pieR, 2 * pieR);
-                        // A hint of fill even at 1%, so "in use" never reads as "empty".
-                        float sweep = Math.Max(8f, (float)(Math.Min(100, pct) * 3.6));
                         using (var b = new SolidBrush(tint))
                             g.FillPie(b, pieRect.X, pieRect.Y, pieRect.Width, pieRect.Height, -90f, sweep);
                     }
@@ -928,7 +934,7 @@ namespace ClaudeUsageTray
         {
             if (Visible) { HidePopup(); return; }
             if ((DateTime.UtcNow - hiddenAt).TotalMilliseconds < 250) return; // click on tray icon that just closed us
-            app.Rescan();
+            app.Scan();   // local transcript stats only; the API stays on its schedule
             a = 0; slide = 1; animStart = DateTime.UtcNow;
             Rebuild();
             Show();
@@ -1092,12 +1098,13 @@ namespace ClaudeUsageTray
             {
                 int n = (int)Math.Ceiling(sweep / 3f);
                 float seg = sweep / n;
-                for (int i = 0; i < n; i++)
-                {
-                    float s = i * seg;
-                    using (var p = new Pen(pal.Usage((s + seg / 2) / 3.6), stroke))
+                using (var p = new Pen(pal.Track, stroke))
+                    for (int i = 0; i < n; i++)
+                    {
+                        float s = i * seg;
+                        p.Color = pal.Usage((s + seg / 2) / 3.6);
                         g.DrawArc(p, rr, -90 + s, seg + (i < n - 1 ? 0.8f : 0));
-                }
+                    }
             }
             float R = rr.Width / 2, cx = rr.X + R, cy = rr.Y + R;
             Dot(cx, cy - R, stroke / 2, pal.Usage(0));
@@ -1168,7 +1175,7 @@ namespace ClaudeUsageTray
             float sx = W - P - sw;
             Txt(stText, fSmall, hovRefresh ? pal.Text : pal.Tertiary, sx, y - 1 * k);
             Dot(sx - 8 * k, y - 5 * k, 3 * k, dot);
-            Add(new RectangleF(sx - 16 * k, y - 18 * k, sw + 20 * k, 26 * k), "refresh", delegate { app.RefreshAll(true); });
+            Add(new RectangleF(sx - 16 * k, y - 18 * k, sw + 20 * k, 26 * k), "refresh", delegate { app.RefreshAll(); });
 
             if (app.Api != null && app.Api.Error != null)
             {
