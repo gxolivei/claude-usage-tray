@@ -6,6 +6,12 @@ the tray and changes color only when a limit gets close.
 
 > Unofficial community project. Not affiliated with or endorsed by Anthropic.
 
+<p align="center">
+  <img src="docs/popup-light.png" alt="Popup in light theme: session and weekly rings, today's activity, last 7 days, models and 5-hour windows" width="348">
+  &nbsp;&nbsp;
+  <img src="docs/popup-dark.png" alt="The same popup in dark theme" width="348">
+</p>
+
 ## Features
 
 - **Tray dial:** a monochrome circle that fills clockwise with your 5-hour session usage. It
