@@ -57,6 +57,14 @@ The result should match the release notes (case doesn't matter). Release builds 
 from the tagged source by [GitHub Actions](.github/workflows/release.yml), not on a
 developer's machine.
 
+## Uninstall
+
+1. Right-click the tray icon and uncheck **Start with Windows** (this removes its startup
+   entry), then choose **Exit**.
+2. Delete `ClaudeUsage.exe`, and the `%LOCALAPPDATA%\ClaudeUsageTray` folder if it exists.
+
+Nothing else is left behind: there's no installer, service, or other registry change.
+
 ## Build from source
 
 The widget reads your Claude login token, so if you'd rather not trust a downloaded
@@ -72,13 +80,39 @@ build.cmd
 or Visual Studio needed. The whole app is that one file, so it's practical to read before
 you run it. Quit the running widget first so `ClaudeUsage.exe` can be overwritten.
 
-## Privacy
+## Privacy policy
 
-- Your Claude Code OAuth token is read from your local `.credentials.json` and sent only
-  to `api.anthropic.com`, to read your usage.
+Claude Usage Tray collects no telemetry and has no server of its own. Its only network
+traffic is to Anthropic, the service you're checking:
+
+- It reads your Claude Code OAuth token from your local `.credentials.json` (on Windows
+  or in your WSL distros) and sends it
+  only to `api.anthropic.com`, to read your own usage and plan. That is the app's whole
+  purpose; running it is the request.
 - Activity charts come from Claude Code's local transcript files. They are parsed on your
   machine and never uploaded.
+- "Open usage page" opens `claude.ai` in your browser only when you click it.
 - Crashes are logged locally to `%LOCALAPPDATA%\ClaudeUsageTray\crash.log`.
+- **Start with Windows** is off until you turn it on. It adds one per-user startup entry
+  (`HKCU\Software\Microsoft\Windows\CurrentVersion\Run\ClaudeUsageTray`) and removes it
+  when you turn it off.
+
+Data sent to Anthropic is covered by [Anthropic's privacy policy](https://www.anthropic.com/legal/privacy).
+
+## Code signing policy
+
+Free code signing provided by [SignPath.io](https://signpath.io), certificate by
+[SignPath Foundation](https://signpath.org).
+
+> Signing is pending approval of this project's SignPath Foundation application. Until
+> then, releases are unsigned; each release's notes say whether it is signed.
+
+- Committers and reviewers: [@gxolivei](https://github.com/gxolivei)
+- Approvers: [@gxolivei](https://github.com/gxolivei)
+
+Every release is built from its tagged source by
+[GitHub Actions](.github/workflows/release.yml); signing requires manual approval of each
+release. See the [privacy policy](#privacy-policy) above.
 
 ## Usage API polling
 

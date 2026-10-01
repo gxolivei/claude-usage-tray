@@ -26,6 +26,13 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      - name: Stamp version
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_REF_NAME -notmatch '^v(\d+\.\d+\.\d+)$') { throw "Tag must look like v1.2.3, got $env:GITHUB_REF_NAME" }
+          $v = "$($Matches[1]).0"
+          (Get-Content src\AssemblyInfo.cs) -replace '0\.0\.0\.0', $v | Set-Content src\AssemblyInfo.cs
+
       - name: Build
         shell: cmd
         run: call build.cmd
