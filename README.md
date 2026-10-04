@@ -14,9 +14,10 @@ the tray and changes color only when a limit gets close.
 
 ## Features
 
-- **Tray dial:** a monochrome circle that fills clockwise with your 5-hour session usage. It
-  turns amber when any limit reaches 80%, red at 95%, and closes into a solid disc when a limit
-  is used up. Hover for exact numbers and reset times.
+- **Tray dial:** a monochrome dial whose inner pie fills clockwise with your 5-hour session
+  usage and whose outer ring fills with your week. The pie closes into a solid disc and the
+  ring into a full circle when a limit is used up. It turns amber when any limit reaches 80%
+  and red at 95%. Hover for exact numbers and reset times.
 - **Popup:** click the icon for session and weekly rings, a bar per limit, and charts of
   your Claude Code activity by hour and by day, broken down by model.
 - **Notifications** when a limit crosses 80% and 95%.

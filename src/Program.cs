@@ -630,7 +630,7 @@ namespace ClaudeUsageTray
 
             tray.ContextMenuStrip = menu;
             tray.Text = "Claude usage — loading";
-            SetIcon(-1, 0);
+            SetIcon(-1, -1, 0);
             tray.Visible = true;
             tray.MouseClick += (s, e) => { if (e.Button == MouseButtons.Left) popup.Toggle(); };
 
@@ -723,9 +723,9 @@ namespace ClaudeUsageTray
             var limits = Limits();
             var session = limits.FirstOrDefault(l => l.Kind == "session");
             var week = limits.FirstOrDefault(l => l.Kind == "weekly_all");
-            if (session == null) { SetIcon(-1, 0); tray.Text = Trim("Claude usage — " + (Api != null && Api.Error != null ? Api.Error : "no data")); return; }
+            if (session == null) { SetIcon(-1, -1, 0); tray.Text = Trim("Claude usage — " + (Api != null && Api.Error != null ? Api.Error : "no data")); return; }
 
-            SetIcon(session.Pct, limits.Max(l => l.EffectivePct));
+            SetIcon(session.EffectivePct, week == null ? -1 : week.EffectivePct, limits.Max(l => l.EffectivePct));
             var text = "Claude · 5h " + Math.Round(session.Pct) + "%";
             if (session.ResetUtc.HasValue) text += " (" + Fmt.Span(session.ResetUtc.Value - NowUtc) + ")";
             if (week != null) text += " · week " + Math.Round(week.Pct) + "%";
@@ -750,55 +750,72 @@ namespace ClaudeUsageTray
             }
         }
 
-        // A monochrome glyph that sits with the system tray icons: a hairline dial with a pie
-        // filling clockwise from twelve. Colour appears only as a signal (amber 80%+, red 95%+);
-        // exact figures live in the tooltip. pct < 0 means no data.
-        void SetIcon(double pct, double worst)
+        // A monochrome glyph that sits with the system tray icons: a dial whose pie fills clockwise
+        // from twelve with the 5-hour session and whose ring fills with the week. The pie closes into
+        // a solid disc and the ring into a full circle when a limit is used up. Colour appears only
+        // as a signal (amber 80%+, red 95%+ on any limit); exact figures live in the tooltip.
+        // pct < 0 means no data.
+        void SetIcon(double session, double week, double worst)
         {
             int s = SystemInformation.SmallIconSize.Width;
             bool lightBar = Palette.TaskbarLight();
-            var tp = Palette.For(lightBar);   // the tray follows the taskbar theme, not the apps theme
-            var fg = lightBar ? Color.FromArgb(28, 28, 28) : Color.FromArgb(245, 245, 245);
-            Color tint = worst >= Limit.BadPct ? tp.Bad : worst >= Limit.WarnPct ? tp.Warn : fg;
-            // A hint of fill even at 1%, so "in use" never reads as "empty"; the 8° floor also keeps
-            // FillPie clear of GDI+'s near-zero-sweep exception. Whole degrees are finer than 16px shows.
-            float sweep = pct > 0 && pct < 100 ? Math.Max(8f, (float)Math.Round(pct * 3.6)) : 0;
-
-            // Called every 30s but the inputs change rarely: skip identical redraws (and the Explorer round trip).
-            var key = s + "|" + lightBar + "|" + tint.ToArgb() + "|" + (pct < 0 ? "none" : pct >= 100 ? "full" : sweep.ToString(CultureInfo.InvariantCulture));
+            // Whole degrees are finer than 16px shows. Called every 30s but the inputs change rarely:
+            // skip identical redraws (and the Explorer round trip).
+            int sd = Degrees(session), wd = Degrees(week);
+            int alert = worst >= Limit.BadPct ? 2 : worst >= Limit.WarnPct ? 1 : 0;
+            var key = s + "|" + lightBar + "|" + sd + "|" + wd + "|" + alert;
             if (key == iconKey) return;
             iconKey = key;
 
+            using (var bmp = IconBitmap(s, lightBar, sd, wd, alert))
+            {
+                var hicon = bmp.GetHicon();
+                var icon = (Icon)Icon.FromHandle(hicon).Clone();
+                DestroyIcon(hicon);
+                var old = tray.Icon;
+                tray.Icon = icon;
+                if (old != null) old.Dispose();
+            }
+        }
+
+        static int Degrees(double pct) { return pct < 0 ? -1 : (int)Math.Round(Math.Min(100, pct) * 3.6); }
+
+        // Session and week as whole degrees of sweep, -1 for no data; alert 0, 1 (warn) or 2 (bad).
+        public static Bitmap IconBitmap(int s, bool lightBar, int sessionDeg, int weekDeg, int alert)
+        {
+            var tp = Palette.For(lightBar);   // the tray follows the taskbar theme, not the apps theme
+            var fg = lightBar ? Color.FromArgb(28, 28, 28) : Color.FromArgb(245, 245, 245);
+            var ink = alert >= 2 ? tp.Bad : alert == 1 ? tp.Warn : fg;
+            // The ring's track is the same foreground at low alpha, so it reads on any taskbar colour,
+            // and fainter still while there is nothing to show.
+            var track = Color.FromArgb(sessionDeg < 0 ? (lightBar ? 48 : 63) : (lightBar ? 80 : 105), fg);
+
             const int ss = 4;   // drawn at 4x and downsampled, for clean edges at 16px
+            var bmp = new Bitmap(s, s, PixelFormat.Format32bppArgb);
             using (var big = new Bitmap(s * ss, s * ss, PixelFormat.Format32bppPArgb))
-            using (var bmp = new Bitmap(s, s, PixelFormat.Format32bppArgb))
             {
                 using (var g = Graphics.FromImage(big))
                 {
                     g.SmoothingMode = SmoothingMode.AntiAlias;
                     g.PixelOffsetMode = PixelOffsetMode.HighQuality;
                     float u = s * ss / 16f;   // one unit = one pixel of a 16px icon
-                    float c = 8 * u;
-
-                    float ringR = 7f * u, ringW = 1.25f * u;
-                    var ringRect = new RectangleF(c - ringR, c - ringR, 2 * ringR, 2 * ringR);
-                    if (pct >= 100)
+                    float c = 8 * u, ringW = 3f * u;
+                    // Flat ends on the arc and a whole-pixel stroke keep the ring as crisp as the pie.
+                    var ring = new RectangleF(ringW / 2, ringW / 2, 16 * u - ringW, 16 * u - ringW);
+                    using (var p = new Pen(track, ringW)) g.DrawEllipse(p, ring);
+                    // A hint of fill even at 1%, so "in use" never reads as "empty"; the 8° floor also
+                    // keeps the arc and pie clear of GDI+'s near-zero-sweep exception.
+                    if (weekDeg > 0)
+                        using (var p = new Pen(ink, ringW)) g.DrawArc(p, ring, -90, Math.Max(8, weekDeg));
+                    if (sessionDeg > 0)
                     {
-                        // Limit reached: the dial closes into one solid disc.
-                        using (var b = new SolidBrush(tint)) g.FillEllipse(b, RectangleF.Inflate(ringRect, ringW / 2, ringW / 2));
-                    }
-                    else
-                    {
-                        var ringColor = Color.FromArgb(pct < 0 ? (lightBar ? 90 : 110) : (lightBar ? 150 : 170), fg);
-                        using (var p = new Pen(ringColor, ringW)) g.DrawEllipse(p, ringRect);
-                    }
-
-                    if (sweep > 0)
-                    {
-                        float pieR = 4.9f * u;
-                        var pieRect = new RectangleF(c - pieR, c - pieR, 2 * pieR, 2 * pieR);
-                        using (var b = new SolidBrush(tint))
-                            g.FillPie(b, pieRect.X, pieRect.Y, pieRect.Width, pieRect.Height, -90f, sweep);
+                        float pieR = 4f * u;
+                        var pie = new RectangleF(c - pieR, c - pieR, 2 * pieR, 2 * pieR);
+                        using (var b = new SolidBrush(ink))
+                        {
+                            if (sessionDeg >= 360) g.FillEllipse(b, pie);
+                            else g.FillPie(b, pie.X, pie.Y, pie.Width, pie.Height, -90, Math.Max(8, sessionDeg));
+                        }
                     }
                 }
                 using (var g = Graphics.FromImage(bmp))
@@ -808,13 +825,8 @@ namespace ClaudeUsageTray
                     g.CompositingQuality = CompositingQuality.HighQuality;
                     g.DrawImage(big, new Rectangle(0, 0, s, s));
                 }
-                var hicon = bmp.GetHicon();
-                var icon = (Icon)Icon.FromHandle(hicon).Clone();
-                DestroyIcon(hicon);
-                var old = tray.Icon;
-                tray.Icon = icon;
-                if (old != null) old.Dispose();
             }
+            return bmp;
         }
 
         static void Open(string url) { try { Process.Start(new ProcessStartInfo(url) { UseShellExecute = true }); } catch { } }
