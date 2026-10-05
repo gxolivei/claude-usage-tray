@@ -372,6 +372,8 @@ namespace ClaudeUsageTray
         public string Error, Plan;
         public DateTime FetchedUtc;
         public TimeSpan? Skew;
+        public DateTime TokenExpiresUtc;   // expiry of the login this attempt found, so a fresh one can be spotted
+        public bool RateLimited;
 
         const string Url = "https://api.anthropic.com/api/oauth/usage";
         const string ProfileUrl = "https://api.anthropic.com/api/oauth/profile";
@@ -415,6 +417,14 @@ namespace ClaudeUsageTray
             {
                 var c = Creds.Best();
                 if (c == null) { res.Error = "No Claude Code login found"; return res; }
+                res.TokenExpiresUtc = c.ExpiresUtc;
+                if (c.ExpiresUtc <= DateTime.UtcNow)
+                {
+                    // Claude Code refreshes its login when it next runs; a request now would only fail
+                    // and count against the rate limit. TrayApp watches for the fresh token instead.
+                    res.Error = "Login expired — use Claude Code once to refresh it";
+                    return res;
+                }
                 RefreshPlan(c.Token);
                 res.Plan = profilePlan ?? c.Plan;
                 var req = Request(Url, c.Token);
@@ -433,7 +443,7 @@ namespace ClaudeUsageTray
                 var hr = we.Response as HttpWebResponse;
                 int code = hr == null ? 0 : (int)hr.StatusCode;
                 if (code == 401) res.Error = "Login expired — use Claude Code once to refresh it";
-                else if (code == 429) res.Error = "Rate limited — next try in " + TrayApp.PollMinutes + " min";
+                else if (code == 429) { res.Error = "Rate limited"; res.RateLimited = true; }   // TrayApp adds the retry time
                 else res.Error = code > 0 ? "API error " + code : "Offline";
             }
             catch (Exception e) { res.Error = e.Message; }
@@ -594,12 +604,16 @@ namespace ClaudeUsageTray
         int ticks;
         bool scanning, fetching;
         // Polling policy for /api/oauth/usage (an undocumented endpoint that rate limits per token):
-        // fetch once at launch, then every PollMinutes, plus whenever the user clicks Refresh.
-        // Nothing else triggers a fetch: opening the popup only rescans local transcripts, and
-        // errors (429 included) wait for the next regular poll rather than retrying sooner.
-        // A Refresh click restarts the PollMinutes cycle. See README.md.
+        // fetch at launch unless the response saved by the previous run is still fresh, then every
+        // PollMinutes, plus whenever the user clicks Refresh (which restarts the cycle). Opening the
+        // popup only rescans local transcripts. An expired login sends nothing: the widget watches
+        // the credentials file and fetches as soon as Claude Code has refreshed it. After a 429 the
+        // wait starts at PollMinutes and doubles, up to an hour, while scheduled retries keep
+        // failing. See README.md.
         public const int PollMinutes = 10;
         DateTime nextFetchUtc = DateTime.MinValue;
+        int backoffMinutes;   // current wait after a 429; 0 when not rate limited
+        static readonly string CachePath = Path.Combine(Path.GetDirectoryName(Program.LogPath), "usage.json");
         string iconKey;
         readonly HashSet<string> notified = new HashSet<string>();
 
@@ -636,7 +650,12 @@ namespace ClaudeUsageTray
 
             timer.Tick += delegate { Tick(); };
             timer.Start();
-            RefreshAll();
+            LoadCache();
+            if (LastGood != null) UpdateTray();
+            Scan();
+            if (LastGood != null && DateTime.UtcNow - LastGood.FetchedUtc < TimeSpan.FromMinutes(PollMinutes))
+                nextFetchUtc = LastGood.FetchedUtc.AddMinutes(PollMinutes);
+            else Fetch(false);
         }
 
         protected override void ExitThreadCore()
@@ -653,7 +672,8 @@ namespace ClaudeUsageTray
             ticks++;
             if (snapshot != null && ticks == 6) { popup.ForceHover = snapHover; popup.Rebuild(); popup.SaveFrame(snapshot); ExitThread(); return; }
             if (ticks % 20 == 0) Scan();
-            if (DateTime.UtcNow >= nextFetchUtc) Fetch();
+            if (DateTime.UtcNow >= nextFetchUtc) Fetch(false);
+            if (ticks % 30 == 15 && Api != null && Api.Error != null) WatchLogin();
             if (popup.Visible) popup.Rebuild();
             if (ticks % 30 == 0) UpdateTray();
         }
@@ -662,7 +682,7 @@ namespace ClaudeUsageTray
         {
             nextFetchUtc = DateTime.MinValue;   // if a fetch is already in flight, the next tick fetches again
             Scan();
-            Fetch();
+            Fetch(true);
         }
 
         public void Scan()
@@ -694,7 +714,8 @@ namespace ClaudeUsageTray
             try { EmptyWorkingSet(Process.GetCurrentProcess().Handle); } catch { }
         }
 
-        void Fetch()
+        // manual: a Refresh click, which always fetches but never lengthens the rate-limit wait.
+        void Fetch(bool manual)
         {
             if (fetching) return;
             fetching = true;
@@ -702,13 +723,21 @@ namespace ClaudeUsageTray
             ThreadPool.QueueUserWorkItem(delegate
             {
                 var res = ApiResult.Fetch();
+                if (res.Raw != null) SaveCache(res);
                 popup.BeginInvoke((Action)delegate
                 {
                     fetching = false;
                     Api = res;
                     if (res.Plan != null) Plan = res.Plan;
                     if (res.Skew.HasValue) Skew = Math.Abs(res.Skew.Value.TotalSeconds) > 30 ? res.Skew.Value : TimeSpan.Zero;
-                    if (res.Raw != null) LastGood = res;
+                    if (res.Raw != null) { LastGood = res; backoffMinutes = 0; }
+                    if (res.RateLimited)
+                    {
+                        if (backoffMinutes == 0) backoffMinutes = PollMinutes;
+                        else if (!manual) backoffMinutes = Math.Min(60, backoffMinutes * 2);
+                        nextFetchUtc = DateTime.UtcNow.AddMinutes(backoffMinutes);
+                        res.Error = "Rate limited — next try at " + Fmt.Clock(ToLocal(nextFetchUtc));
+                    }
                     UpdateTray();
                     Notify();
                     if (popup.Visible) popup.Rebuild();
@@ -716,7 +745,56 @@ namespace ClaudeUsageTray
             });
         }
 
-        public List<Limit> Limits() { return LastGood == null ? new List<Limit>() : LastGood.Limits(); }
+        // While the API is unusable, look for a fresh login locally (no request) and fetch as soon
+        // as one appears, rather than waiting out the poll interval or the backoff.
+        void WatchLogin()
+        {
+            if (fetching) return;
+            var seen = Api.TokenExpiresUtc;
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                var c = Creds.Best();
+                if (c == null || c.ExpiresUtc <= DateTime.UtcNow || c.ExpiresUtc == seen) return;
+                popup.BeginInvoke((Action)delegate { nextFetchUtc = DateTime.MinValue; });
+            });
+        }
+
+        void LoadCache()
+        {
+            try
+            {
+                if (!File.Exists(CachePath)) return;
+                var d = new JavaScriptSerializer { MaxJsonLength = int.MaxValue }.DeserializeObject(File.ReadAllText(CachePath));
+                var fetched = J.Time(J.Get(d, "fetched"));
+                var raw = J.Get(d, "usage");
+                if (fetched == null || raw == null) return;
+                LastGood = new ApiResult { Raw = raw, FetchedUtc = fetched.Value, Plan = J.Str(J.Get(d, "plan")) };
+                if (LastGood.Plan != null) Plan = LastGood.Plan;
+            }
+            catch { }
+        }
+
+        // The last good response, so a restart shows it (marked with its age) instead of nothing and
+        // need not spend a request while it is fresh. Usage figures only; the login token never goes here.
+        static void SaveCache(ApiResult res)
+        {
+            try
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(CachePath));
+                var d = new Dictionary<string, object> { { "fetched", res.FetchedUtc.ToString("o") }, { "plan", res.Plan }, { "usage", res.Raw } };
+                File.WriteAllText(CachePath, new JavaScriptSerializer { MaxJsonLength = int.MaxValue }.Serialize(d));
+            }
+            catch { }
+        }
+
+        public List<Limit> Limits()
+        {
+            var list = LastGood == null ? new List<Limit>() : LastGood.Limits();
+            // A window whose reset time has passed (stale data, or between polls) has started afresh.
+            foreach (var l in list)
+                if (l.ResetUtc.HasValue && l.ResetUtc.Value <= NowUtc) { l.Pct = 0; l.Severity = "normal"; l.ResetUtc = null; }
+            return list;
+        }
 
         void UpdateTray()
         {
@@ -729,7 +807,9 @@ namespace ClaudeUsageTray
             var text = "Claude · 5h " + Math.Round(session.Pct) + "%";
             if (session.ResetUtc.HasValue) text += " (" + Fmt.Span(session.ResetUtc.Value - NowUtc) + ")";
             if (week != null) text += " · week " + Math.Round(week.Pct) + "%";
-            if (Api != null && Api.Error != null) text += " · stale";
+            if (Api == null) text += " · " + Fmt.Ago(DateTime.UtcNow - LastGood.FetchedUtc);   // the previous run's response
+            else if (Api.RateLimited) text += " · stale, retry " + Fmt.Clock(ToLocal(nextFetchUtc));
+            else if (Api.Error != null) text += " · stale";
             tray.Text = Trim(text);
         }
 
@@ -1173,14 +1253,19 @@ namespace ClaudeUsageTray
 
             string st;
             Color dot;
-            if (app.Api == null) { st = "Syncing"; dot = pal.Tertiary; }
-            else if (app.Api.Error != null) { st = "Stale"; dot = pal.Warn; }
-            else
+            var good = app.LastGood;
+            if (app.Api != null && app.Api.Error != null)
             {
-                var ago = DateTime.UtcNow - app.Api.FetchedUtc;
-                st = ago.TotalSeconds < 60 ? "Live" : Fmt.Span(ago) + " ago";
-                dot = pal.Good;
+                st = good == null ? "Stale" : "Stale · " + Fmt.Ago(DateTime.UtcNow - good.FetchedUtc);
+                dot = pal.Warn;
             }
+            else if (good != null)
+            {
+                var ago = DateTime.UtcNow - good.FetchedUtc;
+                st = ago.TotalSeconds < 60 ? "Live" : Fmt.Span(ago) + " ago";
+                dot = app.Api == null ? pal.Tertiary : pal.Good;   // grey while it is still the previous run's response
+            }
+            else { st = "Syncing"; dot = pal.Tertiary; }
             bool hovRefresh = hover == "refresh";
             var stText = hovRefresh ? "Refresh" : st;
             float sw = Measure(stText, fSmall);
