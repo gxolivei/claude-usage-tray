@@ -680,9 +680,8 @@ namespace ClaudeUsageTray
 
         public void RefreshAll()
         {
-            nextFetchUtc = DateTime.MinValue;   // if a fetch is already in flight, the next tick fetches again
             Scan();
-            Fetch(true);
+            Fetch(true);   // a fetch already in flight answers the click; no follow-up request
         }
 
         public void Scan()
