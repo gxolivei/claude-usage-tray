@@ -14,9 +14,10 @@ the tray and changes color only when a limit gets close.
 
 ## Features
 
-- **Tray dial:** a monochrome circle that fills clockwise with your 5-hour session usage. It
-  turns amber when any limit reaches 80%, red at 95%, and closes into a solid disc when a limit
-  is used up. Hover for exact numbers and reset times.
+- **Tray dial:** a monochrome dial whose inner pie fills clockwise with your 5-hour session
+  usage and whose outer ring fills with your week. The pie closes into a solid disc and the
+  ring into a full circle when a limit is used up. It turns amber when any limit reaches 80%
+  and red at 95%. Hover for exact numbers and reset times.
 - **Popup:** click the icon for session and weekly rings, a bar per limit, and charts of
   your Claude Code activity by hour and by day, broken down by model.
 - **Notifications** when a limit crosses 80% and 95%.
@@ -99,6 +100,8 @@ traffic is to Anthropic, the service you're checking:
   machine and never uploaded.
 - "Open usage page" opens `claude.ai` in your browser only when you click it.
 - Crashes are logged locally to `%LOCALAPPDATA%\ClaudeUsageTray\crash.log`.
+- The last usage response is saved to `%LOCALAPPDATA%\ClaudeUsageTray\usage.json` (figures
+  only, never the token) so a restart can show it until the next poll.
 - **Start with Windows** is off until you turn it on. It adds one per-user startup entry
   (`HKCU\Software\Microsoft\Windows\CurrentVersion\Run\ClaudeUsageTray`) and removes it
   when you turn it off.
@@ -128,20 +131,24 @@ is also the one Claude Code itself uses. To avoid wearing it out, the widget fet
 
 | Trigger | When |
 |---|---|
-| Launch | once, as soon as the widget starts |
+| Launch | once, unless the response saved by the previous run is under 10 minutes old |
 | Schedule | every **10 minutes** (`PollMinutes` in `Program.cs`) |
 | Refresh | when you click Refresh (popup button or the tray menu's "Refresh now"); this restarts the 10-minute cycle |
 
 Nothing else calls the API:
 
 - Opening the popup rescans local transcripts only.
-- Errors, including HTTP 429 "Rate limited", get no faster retry. The widget waits for the
-  next scheduled poll or a manual Refresh.
+- An expired login sends nothing. The widget never refreshes the token itself (that would
+  rotate Claude Code's refresh token under it); it checks the credentials file every 30
+  seconds and fetches as soon as Claude Code has refreshed the login.
+- After HTTP 429 "Rate limited" the widget waits 10 minutes, doubling up to an hour while
+  scheduled retries keep failing. The popup and the tooltip show the next try time. A manual
+  Refresh still fetches at once but does not lengthen the wait.
 - The server sends `Retry-After: 0` on 429, so that header is ignored.
 
-Each launch fetches immediately, so relaunching the widget repeatedly (for example while
-developing) uses up the token's allowance too. Because the endpoint is undocumented, it may
-change or break without notice.
+While the API is unavailable the widget keeps showing the last good figures, marked with
+their age, and a window whose reset time has passed shows as empty. Because the endpoint is
+undocumented, it may change or break without notice.
 
 ## Releasing
 
